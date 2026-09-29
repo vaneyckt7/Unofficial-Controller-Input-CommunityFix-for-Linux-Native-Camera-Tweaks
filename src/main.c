@@ -7,12 +7,17 @@
 
 #include "config.h"
 #include "camera_state.h"
+#include "camera_timing.h"
 #include "controller_input.h"
+#include "debug_log.h"
+#include "debug_wobble.h"
 #include "file_stamp.h"
 #include "portable_paths.h"
 #include "sdl_bindings.h"
+#include "stick_owner.h"
 #include "utils.h"
 #include "offsets.h"
+#include "vtable_hook.h"
 
 
 #define VERSION "1.0.22-community-input-fix"
@@ -22,10 +27,18 @@
 
 #define MOUSE_ZOOM_FACTOR 0.25f
 
+#define CAMERA_OBJECT_MODE_FLAGS_OFFSET 0xA8
 #define CAMERA_OBJECT_ROTATION_SPEED_OFFSET 0xC4
-#define MAX_CAMERA_DELTA_TIME 0.1f
-#define MAX_TRACKED_CAMERAS 8
+#define CAMERA_OBJECT_PITCH_OFFSET 0x164
 #define BINDING_RELOAD_INTERVAL_NS 500000000L
+#define DEBUG_REPORT_INTERVAL_NS 500000000L
+#define DEBUG_REPORTED_CAMERAS 4
+
+/* BG3 camera InputEvent, as read by the camera input handler. */
+#define CAMERA_INPUT_ZOOM_IN 0x68
+#define CAMERA_INPUT_ZOOM_OUT 0x69
+#define CAMERA_INPUT_EVENT_VALUE_OFFSET 0x18
+#define CAMERA_INPUT_HANDLER_EVENT_LOAD_OFFSET 0x40d
 
 
 static pid_t g_pid = 0;
@@ -45,6 +58,7 @@ static atomic_int g_controller_right_stick_axis_motion_y = 0;
 static atomic_int g_controller_left_stick_button_down = 0;
 static atomic_int g_controller_left_stick_used_for_zoom = 0;
 static atomic_int g_controller_instance_id = -1;
+static LNCT_StickOwner g_right_stick_owner;
 
 static SDL_Event g_left_stick_down_event;
 static int g_has_left_stick_down_event;
@@ -62,12 +76,38 @@ static LNCT_Config g_config =
 };
 static char g_config_path[1024];
 
+static LNCT_CameraTiming g_camera_timings[LNCT_MAX_TRACKED_CAMERAS];
+static int g_camera_timing_evictions;
+
+/* Diagnostics (LNCT_DEBUG=1).  Camera statistics belong to the camera-hook thread. */
 typedef struct
 {
 	void* camera_object;
-	struct timespec last_update;
-} CameraTiming;
-static CameraTiming g_camera_timings[MAX_TRACKED_CAMERAS];
+	unsigned calls;
+	float delta_time;
+	float mod_pitch;
+	float external_pitch;
+	float rotation_speed;
+	uint32_t mode_flags;
+	float pitch;
+	float zoom;
+	LNCT_Wobble wobble;
+} DebugCameraStats;
+static struct
+{
+	struct timespec window_start;
+	unsigned calls;
+	unsigned untracked_cameras;
+	DebugCameraStats cameras[DEBUG_REPORTED_CAMERAS];
+} g_debug_camera;
+static atomic_llong g_debug_last_camera_call_ns;
+static atomic_int g_debug_right_stick_y_consumed;
+static atomic_int g_debug_wheel_consumed;
+static atomic_int g_debug_zoom_events;
+static atomic_int g_debug_zoom_events_blocked;
+static atomic_llong g_debug_zoom_wait_max_ns;
+static int g_debug_right_stick_ui;
+static struct timespec g_debug_input_window_start;
 
 static BindingSet g_bs;
 static const ActionBindings* g_binds[1];
@@ -92,6 +132,15 @@ __asm__(".symver LNCT_DlsymCompat,dlsym@GLIBC_2.2.5");
 
 typedef float (*CalculateCameraAngle_t)(void*, uint8_t);
 static CalculateCameraAngle_t O_CalculateCameraAngle;
+
+/*
+ * BG3's world-camera input handler (a virtual method).  Returns 0x0101 when it
+ * handled the event, otherwise 0; the result is passed through unchanged.
+ */
+typedef uint64_t (*CameraInputHandler_t)(void*, void*, uint8_t*);
+static CameraInputHandler_t O_CameraInputHandler;
+/* Set once by Setup() on the SDL thread, which is also the only reader. */
+static int g_camera_input_hooked;
 
 enum
 {
@@ -155,6 +204,7 @@ static void ResetControllerState(void)
 	atomic_store(&g_controller_right_stick_axis_motion_y, 0);
 	atomic_store(&g_controller_left_stick_button_down, 0);
 	atomic_store(&g_controller_left_stick_used_for_zoom, 0);
+	LNCT_StickOwnerReset(&g_right_stick_owner);
 }
 
 /*
@@ -268,50 +318,160 @@ static void MaybeReloadRollBindings(void)
 }
 
 
-static float GetCameraDeltaTime(void* camera_object)
+static float GetCameraDeltaTime(void* camera_object, LNCT_CameraTiming** out_timing)
 {
+	*out_timing = NULL;
 	struct timespec now;
 	if (clock_gettime(CLOCK_MONOTONIC, &now) != 0)
 		return 0.f;
 
-	CameraTiming* free_slot = NULL;
-	for (int i = 0; i < MAX_TRACKED_CAMERAS; i++)
-	{
-		CameraTiming* timing = &g_camera_timings[i];
-		if (!timing->camera_object && !free_slot)
-			free_slot = timing;
-		if (timing->camera_object != camera_object)
-			continue;
-
-		float delta_time = (float)(now.tv_sec - timing->last_update.tv_sec)
-			+ (float)(now.tv_nsec - timing->last_update.tv_nsec) / 1000000000.f;
-		timing->last_update = now;
-
-		if (delta_time < 0.f)
-			return 0.f;
-		if (delta_time > MAX_CAMERA_DELTA_TIME)
-			return MAX_CAMERA_DELTA_TIME;
-		return delta_time;
-	}
-
-	/* A new camera gets a timing baseline; movement starts on its next update. */
-	CameraTiming* timing = free_slot ? free_slot : &g_camera_timings[0];
-	timing->camera_object = camera_object;
-	timing->last_update = now;
-	return 0.f;
+	float delta_time;
+	int evicted;
+	*out_timing = LNCT_UpdateCameraTiming(g_camera_timings, LNCT_MAX_TRACKED_CAMERAS,
+		camera_object, &now, &delta_time, &evicted);
+	if (evicted)
+		g_camera_timing_evictions++;
+	return delta_time;
 }
 
 
-float H_CalculateCameraAngle_CallSite(void* pCameraObject, uint8_t angle)
+static long long TimespecNanoseconds(const struct timespec* time)
 {
-	if (!g_setup_succeeded)
-		return O_CalculateCameraAngle(pCameraObject, angle);
+	return (long long)time->tv_sec * 1000000000LL + time->tv_nsec;
+}
 
-	RefreshControllerState();
-	float delta_time = GetCameraDeltaTime(pCameraObject);
+static long long MonotonicNanoseconds(void)
+{
+	struct timespec now;
+	if (clock_gettime(CLOCK_MONOTONIC, &now) != 0)
+		return 0;
+	return TimespecNanoseconds(&now);
+}
+
+/* Whether the map, a book or other UI has taken the right stick from the camera. */
+/*
+ * While UI owns the stick, L3 + stick does not zoom, so an L3 click must reach
+ * BG3.  Unlike RightStickDrivesUI(), safe on the input thread: it logs nothing.
+ */
+static int RightStickOwnedByUI(void)
+{
+	return LNCT_StickOwnerIsUI(&g_right_stick_owner, MonotonicNanoseconds());
+}
+
+static int RightStickDrivesUI(void)
+{
+	int ui = LNCT_StickOwnerIsUI(&g_right_stick_owner, MonotonicNanoseconds());
+	if (LNCT_DebugEnabled() && ui != g_debug_right_stick_ui)
+	{
+		g_debug_right_stick_ui = ui;
+		LNCT_DebugLog("[input] right stick now drives the %s", ui ? "UI" : "camera");
+	}
+	return ui;
+}
+
+static DebugCameraStats* DebugCameraSlot(void* camera_object)
+{
+	for (int i = 0; i < DEBUG_REPORTED_CAMERAS; i++)
+	{
+		DebugCameraStats* stats = &g_debug_camera.cameras[i];
+		if (stats->camera_object == camera_object)
+			return stats;
+		if (!stats->camera_object)
+		{
+			stats->camera_object = camera_object;
+			return stats;
+		}
+	}
+	return NULL;
+}
+
+/*
+ * One line per camera object seen in the last window:
+ *   dt   - summed frame time; about 0.5 for a camera updated every frame
+ *   rot  - raw value at 0xC4, the game's rotationSpeed (controller pitch uses a fixed reference)
+ *   mod  - pitch degrees added by this mod
+ *   ext  - pitch degrees changed by something other than this mod between calls
+ * followed, when any value oscillated, by a "wobble" line: the angle BG3's
+ * CalculateCameraAngle returned and camera-object offsets whose direction of
+ * change reversed, as reversals(min..max).
+ */
+static void DebugCameraReport(const struct timespec* now)
+{
+	if (g_debug_camera.window_start.tv_sec == 0 && g_debug_camera.window_start.tv_nsec == 0)
+		g_debug_camera.window_start = *now;
+	if (TimespecNanoseconds(now) - TimespecNanoseconds(&g_debug_camera.window_start) < DEBUG_REPORT_INTERVAL_NS)
+		return;
+
+	float stick = LNCT_NormalizeControllerAxis((int16_t)atomic_load(&g_controller_right_stick_y));
+	LNCT_DebugLog("[cam] calls=%u cameras_untracked=%u slot_evictions=%d stick_y=%+.2f L3=%d mouse_rotate=%d",
+		g_debug_camera.calls, g_debug_camera.untracked_cameras, g_camera_timing_evictions, stick,
+		atomic_load(&g_controller_left_stick_button_down), atomic_load(&g_roll_keydown));
+	for (int i = 0; i < DEBUG_REPORTED_CAMERAS; i++)
+	{
+		const DebugCameraStats* stats = &g_debug_camera.cameras[i];
+		if (!stats->camera_object)
+			break;
+		LNCT_DebugLog("[cam]   %p calls=%u dt=%.3f rot=%.3f flags=0x%x pitch=%.2f mod=%+.2f ext=%+.2f zoom=%.2f",
+			stats->camera_object, stats->calls, stats->delta_time, stats->rotation_speed,
+			stats->mode_flags, stats->pitch, stats->mod_pitch, stats->external_pitch, stats->zoom);
+		char wobble[512];
+		if (LNCT_WobbleFormat(&stats->wobble, wobble, sizeof(wobble)))
+			LNCT_DebugLog("[cam]   %p wobble %s", stats->camera_object, wobble);
+	}
+	memset(&g_debug_camera, 0, sizeof(g_debug_camera));
+	g_debug_camera.window_start = *now;
+}
+
+static void DebugCameraUpdate(void* camera_object, LNCT_CameraTiming* timing, float delta_time,
+	float pitch_before, float mod_pitch)
+{
+	struct timespec now;
+	if (clock_gettime(CLOCK_MONOTONIC, &now) != 0)
+		return;
+	atomic_store(&g_debug_last_camera_call_ns, TimespecNanoseconds(&now));
+
+	uint8_t* camera = (uint8_t*)camera_object;
+	float pitch_after = *(float*)(camera + CAMERA_OBJECT_PITCH_OFFSET);
+	g_debug_camera.calls++;
+	DebugCameraStats* stats = DebugCameraSlot(camera_object);
+	if (!stats)
+		g_debug_camera.untracked_cameras++;
+	else
+	{
+		stats->calls++;
+		stats->delta_time += delta_time;
+		stats->mod_pitch += mod_pitch;
+		if (timing && timing->has_last_pitch)
+			stats->external_pitch += pitch_before - timing->last_pitch;
+		stats->rotation_speed = *(float*)(camera + CAMERA_OBJECT_ROTATION_SPEED_OFFSET);
+		stats->mode_flags = *(uint32_t*)(camera + CAMERA_OBJECT_MODE_FLAGS_OFFSET);
+		stats->pitch = pitch_after;
+		stats->zoom = *(float*)(camera + LNCT_CAMERA_CURRENT_ZOOM_B_OFFSET);
+		LNCT_WobbleSampleObject(&stats->wobble, camera);
+	}
+	if (timing)
+	{
+		timing->last_pitch = pitch_after;
+		timing->has_last_pitch = 1;
+	}
+	DebugCameraReport(&now);
+}
+
+/* Tracks the angle BG3 computed from the camera, for the wobble report. */
+static void DebugCameraAngle(void* camera_object, float angle)
+{
+	DebugCameraStats* stats = DebugCameraSlot(camera_object);
+	if (stats)
+		LNCT_WobbleSample(&stats->wobble.angle, angle);
+}
+
+/* Apply mod zoom and pitch input.  Returns the pitch change applied, in degrees. */
+static float ApplyCameraInput(void* pCameraObject, float delta_time)
+{
 	int roll_keydown = atomic_load(&g_roll_keydown);
 	int left_stick_button_down = atomic_load(&g_controller_left_stick_button_down);
-	int right_stick_axis_motion_y = atomic_load(&g_controller_right_stick_axis_motion_y);
+	int right_stick_axis_motion_y = atomic_load(&g_controller_right_stick_axis_motion_y)
+		&& !RightStickDrivesUI();
 	if (!roll_keydown && left_stick_button_down && right_stick_axis_motion_y)
 	{
 		int16_t right_stick_y = (int16_t)atomic_load(&g_controller_right_stick_y);
@@ -319,7 +479,7 @@ float H_CalculateCameraAngle_CallSite(void* pCameraObject, uint8_t angle)
 			LNCT_ControllerZoomDelta(right_stick_y, delta_time, g_config.controller_zoom_speed)
 				* (g_config.invert_controller_zoom ? -1.f : 1.f));
 		atomic_store(&g_controller_left_stick_used_for_zoom, 1);
-		return O_CalculateCameraAngle(pCameraObject, angle);
+		return 0.f;
 	}
 	else
 	{
@@ -330,18 +490,17 @@ float H_CalculateCameraAngle_CallSite(void* pCameraObject, uint8_t angle)
 	}
 
 	if (!roll_keydown && !right_stick_axis_motion_y)
-		return O_CalculateCameraAngle(pCameraObject, angle);
+		return 0.f;
 
-	g_roll = (float*)((uint8_t*)pCameraObject + 0x164);
-	float roll = *g_roll;
+	g_roll = (float*)((uint8_t*)pCameraObject + CAMERA_OBJECT_PITCH_OFFSET);
+	float original_roll = *g_roll;
+	float roll = original_roll;
 
 	/* An explicitly held mouse-rotate binding wins over stale controller state. */
 	if (right_stick_axis_motion_y && !roll_keydown)
 	{
 		int16_t value = (int16_t)atomic_load(&g_controller_right_stick_y);
-		float rotation_speed = LNCT_StableRotationSpeed(
-			*(float*)((uint8_t*)pCameraObject + CAMERA_OBJECT_ROTATION_SPEED_OFFSET));
-		float pitch_delta = LNCT_ControllerPitchDelta(value, delta_time, rotation_speed)
+		float pitch_delta = LNCT_ControllerPitchDelta(value, delta_time)
 			* g_config.controller_pitch_sensitivity;
 		roll += g_config.invert_controller_pitch ? -pitch_delta : pitch_delta;
 	}
@@ -361,17 +520,55 @@ float H_CalculateCameraAngle_CallSite(void* pCameraObject, uint8_t angle)
 		roll = roll;
 	*g_roll = roll;
 
-	return O_CalculateCameraAngle(pCameraObject, angle);
+	return roll - original_roll;
 }
 
+float H_CalculateCameraAngle_CallSite(void* pCameraObject, uint8_t angle)
+{
+	if (!g_setup_succeeded)
+		return O_CalculateCameraAngle(pCameraObject, angle);
+
+	RefreshControllerState();
+	LNCT_CameraTiming* timing;
+	float delta_time = GetCameraDeltaTime(pCameraObject, &timing);
+	int debug = LNCT_DebugEnabled();
+	float pitch_before = debug ? *(float*)((uint8_t*)pCameraObject + CAMERA_OBJECT_PITCH_OFFSET) : 0.f;
+	float mod_pitch = ApplyCameraInput(pCameraObject, delta_time);
+	if (debug)
+		DebugCameraUpdate(pCameraObject, timing, delta_time, pitch_before, mod_pitch);
+
+	float result = O_CalculateCameraAngle(pCameraObject, angle);
+	if (debug)
+		DebugCameraAngle(pCameraObject, result);
+	return result;
+}
+
+/*
+ * `movss [rbp+0x164], xmmN` followed by `mulss xmmN, xmmM`: the store-to-load
+ * patch only fixes the view when the register BG3 stores is the one it goes on
+ * to convert to radians for the orientation.
+ */
 static int IsExpectedPitchStore(const uint8_t* instruction)
 {
 	return instruction[0] == 0xF3 && instruction[1] == 0x0F
 		&& instruction[2] == 0x11 && (instruction[3] & 0xC7) == 0x85
 		&& instruction[4] == 0x64 && instruction[5] == 0x01
-		&& instruction[6] == 0x00 && instruction[7] == 0x00;
+		&& instruction[6] == 0x00 && instruction[7] == 0x00
+		&& instruction[8] == 0xF3 && instruction[9] == 0x0F && instruction[10] == 0x59
+		&& (instruction[11] & 0xC0) == 0xC0
+		&& ((instruction[11] >> 3) & 7) == ((instruction[3] >> 3) & 7);
 }
 
+/*
+ * BG3 steps its pitch toward its own zoom-based target, stores it here and
+ * builds the camera's orientation from the stepped value still in the
+ * register.  Storing nothing kept the mod's pitch, but the view was still
+ * built from pitch + step, and the step scales with frame time: the camera
+ * wobbled up and down by a degree or two whenever frame times varied.
+ * Loading the pitch instead of storing it makes the view use the mod's pitch
+ * exactly: `movss [rbp+0x164], xmmN` (F3 0F 11) becomes `movss xmmN,
+ * [rbp+0x164]` (F3 0F 10), same length and operands.
+ */
 uint8_t PatchUpdateCamera()
 {
 	uint8_t* movss = (uint8_t*)GetAddresses()->roll_movss;
@@ -392,10 +589,9 @@ uint8_t PatchUpdateCamera()
 		return 0;
 	}
 
-	uint8_t nop[8] = { 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90 };
 	uint8_t original[8];
 	memcpy(original, movss, sizeof(original));
-	memcpy(movss, nop, sizeof(nop));
+	movss[2] = 0x10;
 	if (mprotect((void*)page_start, num_pages * page_size, PROT_READ | PROT_EXEC) != 0)
 	{
 		memcpy(movss, original, sizeof(original));
@@ -426,6 +622,82 @@ uint8_t SetupCallSitesTrampoline()
 		return 0;
 	}
 
+	return 1;
+}
+
+/*
+ * The right stick's vertical axis reaches BG3 so that UI such as the map and
+ * books can use it.  In the world, BG3 turns it into camera zoom events; while
+ * the stick drives pitch, their value is hidden from the camera handler only,
+ * so the game treats them as below its threshold and does not zoom.  Their
+ * arrival also shows that the camera, not UI, has the stick (stick_owner.h).
+ */
+static uint64_t H_CameraInputHandler(void* self, void* entity, uint8_t* event)
+{
+	int32_t id;
+	memcpy(&id, event, sizeof(id));
+	if (id != CAMERA_INPUT_ZOOM_IN && id != CAMERA_INPUT_ZOOM_OUT)
+		return O_CameraInputHandler(self, entity, event);
+
+	int debug = LNCT_DebugEnabled();
+	long long waited = LNCT_StickOwnerCameraAnswered(&g_right_stick_owner, MonotonicNanoseconds());
+	if (debug)
+	{
+		atomic_fetch_add(&g_debug_zoom_events, 1);
+		long long max = atomic_load(&g_debug_zoom_wait_max_ns);
+		while (waited > max && !atomic_compare_exchange_weak(&g_debug_zoom_wait_max_ns, &max, waited))
+			;
+	}
+	if (!atomic_load(&g_controller_right_stick_axis_motion_y))
+		return O_CameraInputHandler(self, entity, event);
+
+	if (debug)
+		atomic_fetch_add(&g_debug_zoom_events_blocked, 1);
+	float value;
+	const float zero = 0.f;
+	memcpy(&value, event + CAMERA_INPUT_EVENT_VALUE_OFFSET, sizeof(value));
+	memcpy(event + CAMERA_INPUT_EVENT_VALUE_OFFSET, &zero, sizeof(zero));
+	uint64_t result = O_CameraInputHandler(self, entity, event);
+	memcpy(event + CAMERA_INPUT_EVENT_VALUE_OFFSET, &value, sizeof(value));
+	return result;
+}
+
+static uint8_t HookCameraInputHandler(void)
+{
+	struct Sigs* sigs = GetSigs();
+	uint64_t handler = PatternScanSectionUnique(sigs->CameraInputHandler, ".text");
+	if (!handler)
+	{
+		fprintf(stderr, "\e[1;95m[LNCT]\e[0m WARN: camera input handler pattern missing or ambiguous\n");
+		return 0;
+	}
+	uint64_t text_size = 0;
+	uint64_t text = GetSectionAddress(".text", &text_size);
+	uint64_t event_load = handler + CAMERA_INPUT_HANDLER_EVENT_LOAD_OFFSET;
+	if (!text || event_load + 32 > text + text_size
+		|| !PatternMatchesAt((const uint8_t*)event_load, sigs->CameraInputHandler_EventLoad))
+	{
+		fprintf(stderr, "\e[1;95m[LNCT]\e[0m WARN: camera input handler event layout not recognized\n");
+		return 0;
+	}
+
+	uint64_t relro_size = 0;
+	uint8_t* relro = (uint8_t*)GetSectionAddress(".data.rel.ro", &relro_size);
+	uint64_t* slot = relro ? LNCT_FindUniquePointerSlot(relro, relro_size, handler) : NULL;
+	if (!slot)
+	{
+		fprintf(stderr, "\e[1;95m[LNCT]\e[0m WARN: camera input handler vtable slot missing or ambiguous\n");
+		return 0;
+	}
+
+	O_CameraInputHandler = (CameraInputHandler_t)handler;
+	if (!LNCT_SwapPointerSlot(slot, (uint64_t)(uintptr_t)H_CameraInputHandler))
+	{
+		fprintf(stderr, "\e[1;95m[LNCT]\e[0m WARN: couldn't patch the camera input handler vtable slot\n");
+		return 0;
+	}
+	GetAddresses()->CameraInputHandler = handler;
+	LNCT_DebugLog("[setup] camera input handler %p hooked via vtable slot %p", (void*)handler, (void*)slot);
 	return 1;
 }
 
@@ -494,6 +766,15 @@ void Setup()
 
 	ReloadRollBindings();
 
+	char debug_log_path[1024];
+	if (LNCT_DebugInit(g_config.debug_log, debug_log_path, sizeof(debug_log_path)))
+	{
+		fprintf(stdout, "\e[1;95m[LNCT]\e[0m Debug log: %s\n", debug_log_path);
+		LNCT_DebugLog("[setup] LNCT %s, build %lu, controller pitch %.3f, zoom %.3f, mouse pitch %.3f",
+			VERSION, g_game_build, g_config.controller_pitch_sensitivity,
+			g_config.controller_zoom_speed, g_config.mouse_pitch_sensitivity);
+	}
+
 	struct Sigs* sigs = GetSigs();
 	struct Addresses* addresses = GetAddresses();
 	uint64_t camera_pattern = PatternScanSectionUnique(sigs->CalculateCameraAngle_Callsite, ".text");
@@ -531,7 +812,16 @@ void Setup()
 		return;
 	}
 
+	/* Optional: without it the right stick's vertical axis stays hidden from BG3. */
+	g_camera_input_hooked = HookCameraInputHandler();
+	if (!g_camera_input_hooked)
+	{
+		fprintf(stderr, "\e[1;95m[LNCT]\e[0m WARN: right-stick map zoom and book scrolling stay disabled\n");
+		LNCT_DebugLog("[setup] camera input handler not hooked; right stick Y hidden from BG3");
+	}
+
 	g_setup_succeeded = 1;
+	LNCT_DebugLog("[setup] hooks installed");
 	fprintf(stdout, "\e[1;95m[LNCT]\e[0m \e[1;92mEverything has been initialized correctly, enjoy ;)\e[0m\n");
 }
 
@@ -561,6 +851,8 @@ static int HandleSDLEvent(const SDL_Event* event)
 	else if (event->type == SDL_MOUSEWHEEL)
 	{
 		atomic_fetch_add(&g_mouse_wheel_y, event->wheel.y);
+		if (LNCT_DebugEnabled())
+			atomic_fetch_add(&g_debug_wheel_consumed, 1);
 		return 1;
 	}
 	else if (event->type == SDL_MOUSEBUTTONDOWN)
@@ -618,16 +910,23 @@ static int HandleSDLEvent(const SDL_Event* event)
 		atomic_store(&g_controller_instance_id, event->caxis.which);
 		atomic_store(&g_controller_right_stick_y, value);
 		atomic_store(&g_controller_right_stick_axis_motion_y, axis_active);
-		if (axis_active && atomic_load(&g_controller_left_stick_button_down))
+		if (axis_active && atomic_load(&g_controller_left_stick_button_down) && !RightStickOwnedByUI())
 			atomic_store(&g_controller_left_stick_used_for_zoom, 1);
-		return 1;
+		if (LNCT_DebugEnabled())
+			atomic_fetch_add(&g_debug_right_stick_y_consumed, 1);
+		/* With the camera handler hooked, BG3 may use the axis for UI. */
+		if (!g_camera_input_hooked)
+			return 1;
+		if (axis_active)
+			LNCT_StickOwnerEventPassed(&g_right_stick_owner, MonotonicNanoseconds());
+		return 0;
 	}
 	else if ((event->type == SDL_CONTROLLERBUTTONDOWN) && event->cbutton.button == SDL_CONTROLLER_BUTTON_LEFTSTICK)
 	{
 		atomic_store(&g_controller_instance_id, event->cbutton.which);
 		atomic_store(&g_controller_left_stick_button_down, 1);
 		atomic_store(&g_controller_left_stick_used_for_zoom,
-			atomic_load(&g_controller_right_stick_axis_motion_y));
+			atomic_load(&g_controller_right_stick_axis_motion_y) && !RightStickOwnedByUI());
 		g_left_stick_down_event = *event;
 		g_has_left_stick_down_event = 1;
 		return 1;
@@ -661,6 +960,40 @@ static int HandleSDLEvent(const SDL_Event* event)
 	return 0;
 }
 
+/*
+ * Reports right-stick-Y events (hidden from BG3 unless the camera handler is
+ * hooked), hidden mouse-wheel events, and camera zoom events that reached BG3's
+ * camera handler and how many of them the mod blocked.  zoom_wait_max_ms is the
+ * longest a deflected stick event waited for its zoom event; the UI takes the
+ * stick after LNCT_STICK_UI_TIMEOUT_NS.  camera_idle_ms shows whether the world
+ * camera was still updating at that time.
+ */
+static void DebugInputReport(void)
+{
+	struct timespec now;
+	if (clock_gettime(CLOCK_MONOTONIC, &now) != 0)
+		return;
+	if (g_debug_input_window_start.tv_sec == 0 && g_debug_input_window_start.tv_nsec == 0)
+		g_debug_input_window_start = now;
+	if (TimespecNanoseconds(&now) - TimespecNanoseconds(&g_debug_input_window_start) < DEBUG_REPORT_INTERVAL_NS)
+		return;
+	g_debug_input_window_start = now;
+
+	int right_stick_y = atomic_exchange(&g_debug_right_stick_y_consumed, 0);
+	int wheel = atomic_exchange(&g_debug_wheel_consumed, 0);
+	int zoom_events = atomic_exchange(&g_debug_zoom_events, 0);
+	int zoom_blocked = atomic_exchange(&g_debug_zoom_events_blocked, 0);
+	long long zoom_wait_max = atomic_exchange(&g_debug_zoom_wait_max_ns, 0);
+	if (!right_stick_y && !wheel && !zoom_events)
+		return;
+	long long last_camera_call = atomic_load(&g_debug_last_camera_call_ns);
+	long long camera_idle_ms = last_camera_call
+		? (TimespecNanoseconds(&now) - last_camera_call) / 1000000LL : -1;
+	LNCT_DebugLog("[input] right_stick_y=%d (%s) wheel_consumed=%d camera_zoom_events=%d blocked=%d zoom_wait_max_ms=%.1f camera_idle_ms=%lld",
+		right_stick_y, g_camera_input_hooked ? "passed" : "consumed", wheel, zoom_events, zoom_blocked,
+		(double)zoom_wait_max / 1000000.0, camera_idle_ms);
+}
+
 static int PopDeferredControllerEvent(SDL_Event* event)
 {
 	if (g_deferred_controller_event_index >= g_deferred_controller_event_count)
@@ -687,6 +1020,8 @@ int SDL_PollEvent(SDL_Event* event)
 	if (!g_setup_succeeded)
 		return O_PollEvent(event);
 	MaybeReloadRollBindings();
+	if (LNCT_DebugEnabled())
+		DebugInputReport();
 
 	/* Preserve SDL_PollEvent(NULL)'s queue-check semantics. */
 	if (!event)

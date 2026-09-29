@@ -48,6 +48,7 @@ void LNCT_SetConfigDefaults(LNCT_Config* config)
 	config->mouse_pitch_sensitivity = LNCT_DEFAULT_MOUSE_PITCH_SENSITIVITY;
 	config->invert_controller_pitch = 0;
 	config->invert_controller_zoom = LNCT_DEFAULT_INVERT_CONTROLLER_ZOOM;
+	config->debug_log = 0;
 }
 
 static int EnsureParentDirectory(const char* path)
@@ -87,7 +88,7 @@ static int WriteDefaultConfig(const LNCT_Config* config, const char* path)
 	fprintf(file,
 		"# Linux Native Camera Tweaks controller settings\n"
 		"# Restart BG3 after changing this file.\n"
-		"# 1.0 = previous input-fix.1 pitch speed; 0.25 = one quarter.\n"
+		"# Full-stick tilt speed is about 47 degrees/second times this value.\n"
 		"controller_pitch_sensitivity=%.2f\n"
 		"controller_zoom_speed=%.2f\n"
 		"# Vertical camera speed while the mouse-rotate button is held.\n"
@@ -173,6 +174,8 @@ int LNCT_LoadConfig(LNCT_Config* config, char* path, size_t path_size)
 			ParseBool(value, &config->invert_controller_pitch);
 		else if (!strcmp(key, "invert_controller_zoom"))
 			has_invert_controller_zoom = ParseBool(value, &config->invert_controller_zoom);
+		else if (!strcmp(key, "debug_log"))
+			ParseBool(value, &config->debug_log);
 	}
 
 	fclose(file);

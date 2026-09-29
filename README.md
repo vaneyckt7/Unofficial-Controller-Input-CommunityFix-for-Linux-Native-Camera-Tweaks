@@ -9,7 +9,9 @@ A native Linux camera mod for **Baldur’s Gate 3**, originally created by **Bii
 ## Features
 
 * Extended vertical camera rotation with mouse and controller.
-* Frame-rate-independent and configurable controller pitch.
+* Frame-rate-independent and configurable controller pitch, at the same speed in every area.
+* The right stick still zooms the world map and scrolls books and scrolls,
+  without tilting the camera behind them.
 * L3 + right-stick vertical movement for smooth zoom control.
 * Normal L3 clicks remain available when L3 is not used for zooming.
 * Stable switching between controller and mouse/keyboard.
@@ -69,7 +71,9 @@ invert_controller_pitch=false
 invert_controller_zoom=false
 ```
 
-* `controller_pitch_sensitivity`: vertical controller camera speed
+* `controller_pitch_sensitivity`: vertical controller camera speed (0.25 is
+  about 12 degrees per second at full stick). An existing file keeps its value,
+  so edit it there to change the speed.
 * `controller_zoom_speed`: L3 + right-stick zoom speed
 * `mouse_pitch_sensitivity`: vertical mouse camera speed
 * `invert_controller_pitch`: reverses vertical controller rotation
@@ -111,7 +115,19 @@ ctest --test-dir build --output-on-failure
 
 The resulting shared object requires GLIBC 2.17 or newer and has no direct SDL runtime dependency.
 
+Without a Linux machine, `./docker-build.sh` builds and tests the same x86-64 shared object in a container, including on Apple Silicon Macs. The result is written to `build-docker/linux_native_camera_tweaks.so`.
+
 Runtime camera-hook validation still requires the native Linux version of BG3.
+
+## Diagnostics
+
+Add `debug_log=true` to `~/.config/bg3-native-camera-tweaks.conf`, or `LNCT_DEBUG=1` to the launch options, to write a diagnostic log:
+
+```text
+LNCT_DEBUG=1 LD_PRELOAD="~/Mods/BG3/linux_native_camera_tweaks.so" %command%
+```
+
+`LNCT_DEBUG=0` disables the log even when the config file enables it. The log is written to `/tmp/lnct-debug.log` (override with `LNCT_DEBUG_LOG=/path/to/file`). Twice a second it records, per camera object, the frame time, the camera's rotation speed, the pitch change applied by the mod, and any pitch change made by the game itself. It also records right-stick-Y events, hidden mouse-wheel events, the camera zoom events that reached BG3's camera handler and how many the mod blocked, and how long ago the world camera last updated.
 
 ## Credits
 

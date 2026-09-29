@@ -21,15 +21,14 @@ int main(void)
 	float pitch_60_fps = 0.0f;
 	float pitch_120_fps = 0.0f;
 	for (int i = 0; i < 60; i++)
-		pitch_60_fps += LNCT_ControllerPitchDelta(INT16_MAX, 1.0f / 60.0f, 120.0f);
+		pitch_60_fps += LNCT_ControllerPitchDelta(INT16_MAX, 1.0f / 60.0f);
 	for (int i = 0; i < 120; i++)
-		pitch_120_fps += LNCT_ControllerPitchDelta(INT16_MAX, 1.0f / 120.0f, 120.0f);
+		pitch_120_fps += LNCT_ControllerPitchDelta(INT16_MAX, 1.0f / 120.0f);
 
-	assert(NearlyEqual(pitch_60_fps, 120.0f, 0.001f));
+	/* Full deflection for one second turns by the reference rotation speed. */
+	assert(NearlyEqual(pitch_60_fps, LNCT_CONTROLLER_REFERENCE_ROTATION_SPEED, 0.001f));
 	assert(NearlyEqual(pitch_60_fps, pitch_120_fps, 0.001f));
-	assert(NearlyEqual(LNCT_StableRotationSpeed(-120.f), 120.f, 0.001f));
-	assert(NearlyEqual(LNCT_StableRotationSpeed(120.f), 120.f, 0.001f));
-	assert(LNCT_StableRotationSpeed(NAN) == 0.f);
+	assert(LNCT_ControllerPitchDelta(INT16_MIN, 1.0f) < 0.0f);
 
 	float zoom_60_fps = 0.0f;
 	float zoom_120_fps = 0.0f;

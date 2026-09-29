@@ -234,6 +234,18 @@ static uint64_t GetSectionAddress(const char* section, uint64_t* size_buffer)
     return result;
 }
 
+static int PatternMatchesAt(const uint8_t* address, const char* ida_pattern)
+{
+    Pattern pattern;
+    BuildPattern(&pattern, ida_pattern);
+    for (uint16_t p = 0; p < pattern.length; p++)
+    {
+        if (pattern.mask[p] == 'x' && address[p] != pattern.bytes[p])
+            return 0;
+    }
+    return 1;
+}
+
 /* Patching the wrong occurrence is worse than disabling the mod. */
 static uint64_t PatternScanSectionUnique(const char* ida_pattern, const char* section)
 {

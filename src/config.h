@@ -15,6 +15,7 @@ typedef struct
 	float mouse_pitch_sensitivity;
 	int invert_controller_pitch;
 	int invert_controller_zoom;
+	int debug_log;
 } LNCT_Config;
 
 void LNCT_SetConfigDefaults(LNCT_Config* config);

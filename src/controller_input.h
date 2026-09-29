@@ -28,23 +28,25 @@ static inline float LNCT_NormalizeControllerAxis(int16_t value)
 }
 
 /*
- * Windows 2.4.5:
- *   pitchDelta = normalizedAxis * ControllerCameraRotationMult
- *              * deltaTime * camera.rotationSpeed * ControllerPitchMult
+ * BG3's default camera rotationSpeed (camera object +0xC4).  Some areas, such as
+ * the Blighted Village, lower the live value by about 30%; the Windows mod reads
+ * it every frame and slows pitch there too.  Using the default everywhere keeps
+ * controller pitch speed the same in every area.
  */
-static inline float LNCT_ControllerPitchDelta(int16_t value, float delta_time, float rotation_speed)
+#define LNCT_CONTROLLER_REFERENCE_ROTATION_SPEED 47.444f
+
+/*
+ * Windows 2.4.5, with the reference speed in place of camera.rotationSpeed:
+ *   pitchDelta = normalizedAxis * ControllerCameraRotationMult
+ *              * deltaTime * rotationSpeed * ControllerPitchMult
+ */
+static inline float LNCT_ControllerPitchDelta(int16_t value, float delta_time)
 {
 	return LNCT_NormalizeControllerAxis(value)
 		* LNCT_CONTROLLER_CAMERA_ROTATION_MULT
 		* delta_time
-		* rotation_speed
+		* LNCT_CONTROLLER_REFERENCE_ROTATION_SPEED
 		* LNCT_CONTROLLER_PITCH_MULT;
-}
-
-/* Camera modes can expose the same speed with either sign; input controls sign. */
-static inline float LNCT_StableRotationSpeed(float rotation_speed)
-{
-	return isfinite(rotation_speed) ? fabsf(rotation_speed) : 0.f;
 }
 
 static inline float LNCT_ControllerZoomDelta(int16_t value, float delta_time, float zoom_speed)
